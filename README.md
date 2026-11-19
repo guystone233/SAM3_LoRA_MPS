@@ -174,6 +174,24 @@ If you see errors, review the [Troubleshooting](#troubleshooting) section.
 
 ---
 
+## Apple GPU training
+
+From the repository root on an Apple Silicon Mac, install the locked environment with
+`uv sync --locked`. On the first run, the trainer downloads about 3.45 GB using your
+Hugging Face login. If you already have the original `sam3.pt`, set `model.checkpoint_path`
+in `configs/mps.yaml` to its path. [Meta SAM3 checkpoint](https://huggingface.co/facebook/sam3)
+
+```bash
+uv run --locked python train_sam3_lora_native.py \
+  --config configs/mps.yaml --accelerator mps
+```
+
+The configuration uses `train/_annotations.coco.json`, trains the DETR decoder
+adapters with one 336 × 336 image per batch, and writes the adapters to
+`outputs/mps/`. The trainer computes validation loss when
+`data/valid/_annotations.coco.json` exists. With a training-only export,
+`best_lora_weights.pt` is a copy of `last_lora_weights.pt`.
+
 ## Quick Start
 
 > **⚠️ Important**: Make sure you've completed the [Installation](#installation) steps, including Hugging Face login, before proceeding.

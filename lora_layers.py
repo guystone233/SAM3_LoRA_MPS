@@ -524,8 +524,8 @@ def save_lora_weights(model: nn.Module, save_path: str):
     lora_state_dict = {}
     for name, module in model.named_modules():
         if isinstance(module, LoRALayer):
-            lora_state_dict[f"{name}.lora_A"] = module.lora_A
-            lora_state_dict[f"{name}.lora_B"] = module.lora_B
+            lora_state_dict[f"{name}.lora_A"] = module.lora_A.detach().cpu()
+            lora_state_dict[f"{name}.lora_B"] = module.lora_B.detach().cpu()
 
     torch.save(lora_state_dict, save_path)
     print(f"Saved LoRA weights to {save_path}")

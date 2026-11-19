@@ -278,7 +278,8 @@ class TransformerDecoder(nn.Module):
             if resolution is not None and stride is not None:
                 feat_size = resolution // stride
                 coords_h, coords_w = self._get_coords(
-                    feat_size, feat_size, device="cuda"
+                    feat_size, feat_size,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
                 )
                 self.compilable_cord_cache = (coords_h, coords_w)
                 self.compilable_stored_size = (feat_size, feat_size)
@@ -342,14 +343,18 @@ class TransformerDecoder(nn.Module):
         ):
             # good, hitting the cache, will be compilable
             coords_h, coords_w = self.compilable_cord_cache
+            if coords_h.device != reference_boxes.device:
+                coords_h, coords_w = self._get_coords(H, W, reference_boxes.device)
+                self.compilable_cord_cache = (coords_h, coords_w)
         else:
             # cache miss, will create compilation issue
             # In case we're not compiling, we'll still rely on the dict-based cache
-            if feat_size not in self.coord_cache:
-                self.coord_cache[feat_size] = self._get_coords(
+            cache_key = (H, W, reference_boxes.device)
+            if cache_key not in self.coord_cache:
+                self.coord_cache[cache_key] = self._get_coords(
                     H, W, reference_boxes.device
                 )
-            coords_h, coords_w = self.coord_cache[feat_size]
+            coords_h, coords_w = self.coord_cache[cache_key]
 
             assert coords_h.shape == (H,)
             assert coords_w.shape == (W,)

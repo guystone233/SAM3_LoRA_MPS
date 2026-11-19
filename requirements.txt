@@ -40,7 +40,7 @@ submitit>=1.4.0
 iopath>=0.1.10
 
 # Video processing
-decord>=0.6.0
+eva-decord
 
 # Tensor operations
 einops>=0.6.0

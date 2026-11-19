@@ -30,6 +30,12 @@ def inverse_sigmoid(x, eps=1e-3):
 
 class MultiheadAttentionWrapper(nn.MultiheadAttention):
     def forward(self, *args, **kwargs):
+        if self.training and self.dropout and self.out_proj.weight.device.type == "mps":
+            # Request weights to select the explicit attention path, which supports dropout.
+            kwargs["need_weights"] = True
+            kwargs["average_attn_weights"] = False
+            output, _ = super().forward(*args, **kwargs)
+            return output, None
         kwargs["need_weights"] = False
         return super().forward(*args, **kwargs)
 

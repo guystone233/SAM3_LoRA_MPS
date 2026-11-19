@@ -12,10 +12,6 @@ from sam3.model import box_ops
 
 from sam3.model.data_misc import interpolate
 
-from sam3.train.loss.sigmoid_focal_loss import (
-    triton_sigmoid_focal_loss,
-    triton_sigmoid_focal_loss_reduce,
-)
 from torch import nn
 
 from .mask_sampling import (
@@ -148,9 +144,15 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor
     """
+    triton = triton and inputs.is_cuda
     if not (0 <= alpha <= 1) and triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
     if triton:
+        from sam3.train.loss.sigmoid_focal_loss import (
+            triton_sigmoid_focal_loss,
+            triton_sigmoid_focal_loss_reduce,
+        )
+
         if reduce and not loss_on_multimask:
             loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
             return loss / (num_boxes * inputs.shape[1])

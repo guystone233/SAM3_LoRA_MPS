@@ -1,0 +1,29 @@
+model:
+  # Set to a local Meta SAM3 sam3.pt file to use it in place of the Hub download.
+  checkpoint_path: null
+
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj]
+  apply_to_vision_encoder: false
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: false
+
+training:
+  data_dir: "/workspace/data"
+  data_format: coco
+  resolution: 336
+  batch_size: 1
+  num_workers: 0
+  num_negatives: 0
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  num_epochs: 5
+
+output:
+  output_dir: outputs/mps

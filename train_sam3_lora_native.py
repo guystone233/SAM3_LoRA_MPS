@@ -10,15 +10,11 @@ Validation Strategy (Following SAM3):
 This approach significantly speeds up training by avoiding expensive metric computation
 during each epoch, while still monitoring overfitting via validation loss.
 
-Multi-GPU Training:
-  Single GPU:
-    python train_sam3_lora_native.py --config configs/full_lora_config.yaml
+Apple GPU:
+    python train_sam3_lora_native.py --config configs/mps.yaml --accelerator mps
 
-  Multi-GPU (DDP):
-    torchrun --nproc_per_node=2 train_sam3_lora_native.py --config configs/full_lora_config.yaml --multi-gpu
-
-  Multi-GPU with specific GPUs:
-    CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_sam3_lora_native.py --config configs/full_lora_config.yaml --multi-gpu
+CUDA multi-GPU:
+    python train_sam3_lora_native.py --config configs/full_lora_config.yaml --device 0 1
 """
 
 import os
@@ -34,7 +30,7 @@ from tqdm import tqdm
 from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
-import contextlib
+from functools import partial
 
 # Distributed training imports
 import torch.distributed as dist
@@ -58,6 +54,7 @@ from dataset_formats import (
     ODVGDataset,
     PROMPT_SOURCES,
     build_negative_queries,
+    decode_segmentation,
     filter_generic_negatives,
     first_text,
     load_descriptions_sidecar,
@@ -65,7 +62,7 @@ from dataset_formats import (
 )
 
 from torchvision.transforms import v2
-import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
+import pycocotools.mask as mask_utils
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
@@ -148,7 +145,7 @@ class COCOSegmentDataset(Dataset):
 
     def __init__(self, data_dir, split="train", num_negatives=2,
                  generic_negatives=None, prompt_source="auto",
-                 mix_class_prompt=False, num_cross_negatives=2):
+                 mix_class_prompt=False, num_cross_negatives=2, resolution=1008):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
@@ -172,6 +169,7 @@ class COCOSegmentDataset(Dataset):
                 prompt corpus exceeds MAX_ALWAYS_NEGATIVES distinct texts (which
                 is what happens with per-segment descriptions). Below that
                 threshold every absent prompt is used, as before.
+            resolution: Square input and target mask size in pixels.
         """
         if prompt_source not in PROMPT_SOURCES:
             raise ValueError(
@@ -263,7 +261,7 @@ class COCOSegmentDataset(Dataset):
             print(f"  Prompt corpus > {MAX_ALWAYS_NEGATIVES}: sampling "
                   f"{self.num_cross_negatives} cross-prompt negatives per image")
 
-        self.resolution = 1008
+        self.resolution = resolution
         self.transform = v2.Compose([
             v2.ToImage(),
             v2.ToDtype(torch.float32, scale=True),
@@ -365,39 +363,9 @@ class COCOSegmentDataset(Dataset):
                 h * scale_h / self.resolution,
             ], dtype=torch.float32)
 
-            # Handle segmentation mask (polygon or RLE format)
-            segment = None
-            segmentation = ann.get("segmentation", None)
-
-            if segmentation:
-                try:
-                    # Check if it's RLE format (dict) or polygon format (list)
-                    if isinstance(segmentation, dict):
-                        # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
-                    elif isinstance(segmentation, list):
-                        # Polygon format: [[x1, y1, x2, y2, ...], ...]
-                        # Convert polygon to RLE, then decode
-                        rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
-                        rle = mask_utils.merge(rles)
-                        mask_np = mask_utils.decode(rle)
-                    else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
-                        segment = None
-                        continue
-
-                    # Resize mask to model resolution
-                    mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-                    mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
-                    )
-                    segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
-
-                except Exception as e:
-                    print(f"Warning: Error processing mask for image {img_id}, ann {i}: {e}")
-                    segment = None
+            segment = decode_segmentation(
+                ann.get("segmentation"), orig_h, orig_w, self.resolution
+            )
 
             obj = Object(
                 bbox=box_tensor,
@@ -482,6 +450,7 @@ def build_dataset(config, data_dir, split):
     num_negatives = training.get("num_negatives", 2)
     generic_negatives = training.get("generic_negatives", None)
     num_cross_negatives = training.get("num_cross_negatives", 2)
+    resolution = training.get("resolution", 1008)
 
     if data_format == "coco":
         return COCOSegmentDataset(
@@ -492,6 +461,7 @@ def build_dataset(config, data_dir, split):
             prompt_source=training.get("prompt_source", "auto"),
             mix_class_prompt=training.get("mix_class_prompt", False),
             num_cross_negatives=num_cross_negatives,
+            resolution=resolution,
         )
 
     if data_format == "odvg":
@@ -501,6 +471,7 @@ def build_dataset(config, data_dir, split):
             num_negatives=num_negatives,
             generic_negatives=generic_negatives,
             num_cross_negatives=num_cross_negatives,
+            resolution=resolution,
             use_full_caption=training.get("use_full_caption", True),
             annotations_file=training.get("odvg_annotations_file",
                                           "_annotations.odvg.jsonl"),
@@ -963,10 +934,26 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
     return coco_gt
 
 
+def resolve_accelerator(accelerator):
+    if accelerator in ("auto", "cuda") and torch.cuda.is_available():
+        return "cuda"
+    if accelerator in ("auto", "mps") and torch.backends.mps.is_available():
+        return "mps"
+    if accelerator in ("auto", "cpu"):
+        return "cpu"
+    raise RuntimeError(
+        f"Requested accelerator {accelerator!r} is unavailable in this PyTorch session"
+    )
+
+
 class SAM3TrainerNative:
-    def __init__(self, config_path, multi_gpu=False):
+    def __init__(self, config_path, multi_gpu=False, accelerator="auto"):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
+
+        accelerator = resolve_accelerator(accelerator)
+        if multi_gpu and accelerator != "cuda":
+            raise ValueError("Multi-GPU training requires CUDA")
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -979,16 +966,19 @@ class SAM3TrainerNative:
             self.device = torch.device(f"cuda:{self.local_rank}")
             print_rank0(f"Multi-GPU training enabled with {self.world_size} GPUs")
         else:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(accelerator)
+
+        print_rank0(f"Training device: {self.device}")
 
         # Build Model
         print_rank0("Building SAM3 model...")
         self.model = build_sam3_image_model(
-            device=self.device.type,
+            device="cpu",  # Inject LoRA before transferring the model to the GPU.
             compile=False,
-            load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
-            bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=False
+            checkpoint_path=self.config.get("model", {}).get("checkpoint_path"),
+            load_from_HF=True,
+            eval_mode=False,
+            resolution=self.config["training"].get("resolution", 1008),
         )
 
         # Apply LoRA
@@ -1125,8 +1115,7 @@ class SAM3TrainerNative:
         if not has_validation:
             val_ds = None
 
-        def collate_fn(batch):
-            return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
+        collate_fn = partial(collate_fn_api, dict_key="input", with_seg_masks=True)
 
         # Create samplers for distributed training
         train_sampler = None
@@ -1154,7 +1143,7 @@ class SAM3TrainerNative:
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=self.config["training"].get("num_workers", 0),
-            pin_memory=True
+            pin_memory=self.device.type == "cuda"
         )
 
         if has_validation:
@@ -1165,7 +1154,7 @@ class SAM3TrainerNative:
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 num_workers=self.config["training"].get("num_workers", 0),
-                pin_memory=True
+                pin_memory=self.device.type == "cuda"
             )
         else:
             val_loader = None
@@ -1353,7 +1342,10 @@ class SAM3TrainerNative:
                             "val_loss": avg_val_loss
                         }) + "\n")
 
-                torch.cuda.empty_cache()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                elif self.device.type == "mps":
+                    torch.mps.empty_cache()
 
                 # Back to training mode
                 self.model.train()
@@ -1423,6 +1415,7 @@ def launch_distributed_training(args):
         "--master_port", str(args.master_port),
         sys.argv[0],  # This script
         "--config", args.config,
+        "--accelerator", "cuda",
         "--device", *map(str, devices),
         "--_launched_by_torchrun"  # Internal flag to indicate we're in subprocess
     ]
@@ -1442,7 +1435,10 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Single GPU (default GPU 0):
+  Apple GPU:
+    python train_sam3_lora_native.py --config configs/mps.yaml --accelerator mps
+
+  Automatically select CUDA, Apple GPU, or CPU:
     python train_sam3_lora_native.py --config configs/full_lora_config.yaml
 
   Single GPU (specific GPU):
@@ -1465,11 +1461,17 @@ Examples:
         help="Path to YAML configuration file"
     )
     parser.add_argument(
+        "--accelerator",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default="auto",
+        help="Training backend (default: auto)",
+    )
+    parser.add_argument(
         "--device",
         type=int,
         nargs="+",
         default=[0],
-        help="GPU device ID(s) to use. Single value for single GPU, multiple values for multi-GPU. "
+        help="CUDA device ID(s) to use. Single value for single GPU, multiple values for multi-GPU. "
              "Example: --device 0 (single GPU), --device 0 1 2 (3 GPUs)"
     )
     parser.add_argument(
@@ -1491,21 +1493,20 @@ Examples:
     )
     args = parser.parse_args()
 
-    # Determine if multi-GPU training is requested
-    num_devices = len(args.device)
     is_torchrun_subprocess = args._launched_by_torchrun or "LOCAL_RANK" in os.environ
+    multi_gpu = len(args.device) > 1 or int(os.environ.get("WORLD_SIZE", "1")) > 1
 
-    if num_devices > 1 and not is_torchrun_subprocess:
-        # Multi-GPU requested but not yet in torchrun - launch it
+    if not is_torchrun_subprocess and not multi_gpu and args.accelerator in ("auto", "cuda"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[0])
+
+    try:
+        accelerator = resolve_accelerator(args.accelerator)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    if multi_gpu and accelerator != "cuda":
+        parser.error("Multi-GPU training requires CUDA")
+    if multi_gpu and not is_torchrun_subprocess:
         launch_distributed_training(args)
-    else:
-        # Single GPU or already in torchrun subprocess
-        multi_gpu = num_devices > 1 and is_torchrun_subprocess
 
-        if not multi_gpu and num_devices == 1:
-            # Single GPU mode - set the device
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[0])
-            print(f"Using single GPU: {args.device[0]}")
-
-        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu)
-        trainer.train()
+    trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu, accelerator=accelerator)
+    trainer.train()

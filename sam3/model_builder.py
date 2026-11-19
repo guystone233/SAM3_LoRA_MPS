@@ -66,10 +66,10 @@ def _create_position_encoding(precompute_resolution=None):
     )
 
 
-def _create_vit_backbone(compile_mode=None):
+def _create_vit_backbone(compile_mode=None, resolution=1008):
     """Create ViT backbone for visual feature extraction."""
     return ViT(
-        img_size=1008,
+        img_size=resolution,
         pretrain_img_size=336,
         patch_size=14,
         embed_dim=1024,
@@ -150,7 +150,7 @@ def _create_transformer_encoder() -> TransformerEncoderFusion:
     return encoder
 
 
-def _create_transformer_decoder() -> TransformerDecoder:
+def _create_transformer_decoder(resolution=1008) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -179,7 +179,7 @@ def _create_transformer_decoder() -> TransformerDecoder:
         frozen=False,
         interaction_layer=None,
         dac_use_selfatt_ln=True,
-        resolution=1008,
+        resolution=resolution,
         stride=14,
         use_act_checkpoint=True,
         presence_token=True,
@@ -496,13 +496,15 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, resolution=1008
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(precompute_resolution=resolution)
     # ViT backbone
-    vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
+    vit_backbone: ViT = _create_vit_backbone(
+        compile_mode=compile_mode, resolution=resolution
+    )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
@@ -512,10 +514,12 @@ def _create_vision_backbone(
     return vit_neck
 
 
-def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrapper:
+def _create_sam3_transformer(
+    has_presence_token: bool = True, resolution=1008
+) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
     encoder: TransformerEncoderFusion = _create_transformer_encoder()
-    decoder: TransformerDecoder = _create_transformer_decoder()
+    decoder: TransformerDecoder = _create_transformer_decoder(resolution=resolution)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
@@ -537,6 +541,12 @@ def _load_checkpoint(model, checkpoint_path):
                 if "tracker" in k
             }
         )
+    # The model has already generated RoPE buffers for its configured image size.
+    for name, buffer in model.named_buffers():
+        if name.endswith(".freqs_cis") and name in sam3_image_ckpt:
+            if sam3_image_ckpt[name].shape != buffer.shape:
+                sam3_image_ckpt[name] = buffer
+
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
     if len(missing_keys) > 0:
         print(
@@ -547,8 +557,7 @@ def _load_checkpoint(model, checkpoint_path):
 
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
-    if device == "cuda":
-        model = model.cuda()
+    model = model.to(device)
     if eval_mode:
         model.eval()
     return model
@@ -563,30 +572,41 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    resolution=1008,
 ):
     """
     Build SAM3 image model
 
     Args:
         bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
+        device: Device to load the model on ('cuda', 'mps' or 'cpu')
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
+        compile: Whether to enable compilation
+        resolution: Square image size in pixels, divisible by 28
 
     Returns:
         A SAM3 image model
     """
+    if not isinstance(resolution, int) or resolution < 28 or resolution % 28:
+        raise ValueError("Image resolution must be a positive multiple of 28")
+    if enable_inst_interactivity and resolution != 1008:
+        raise ValueError("Interactive image prediction requires resolution=1008")
     if bpe_path is None:
         bpe_path = os.path.join(
-            os.path.dirname(__file__), "..", "assets", "bpe_simple_vocab_16e6.txt.gz"
+            os.path.dirname(__file__), "assets", "bpe_simple_vocab_16e6.txt.gz"
         )
+    if load_from_HF and checkpoint_path is None:
+        checkpoint_path = download_ckpt_from_hf()
+
     # Create visual components
     compile_mode = "default" if compile else None
     vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
+        compile_mode=compile_mode,
+        enable_inst_interactivity=enable_inst_interactivity,
+        resolution=resolution,
     )
 
     # Create text components
@@ -596,7 +616,7 @@ def build_sam3_image_model(
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
     # Create transformer components
-    transformer = _create_sam3_transformer()
+    transformer = _create_sam3_transformer(resolution=resolution)
 
     # Create dot product scoring
     dot_prod_scoring = _create_dot_product_scoring()
@@ -625,8 +645,6 @@ def build_sam3_image_model(
         inst_predictor,
         eval_mode,
     )
-    if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
